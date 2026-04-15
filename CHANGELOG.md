@@ -1,6 +1,23 @@
-# WIP
+# WIP: 0.14.6
+
+* Allow `DataTable` objects directly in `ComputeStep.input_dts` parameter
+  (auto-wraps in `ComputeInput`)
+* Add backward compatibility for DataTable API in BatchTransformStep
+* Add optional `force_vectors_to_ram` parameter to `QdrantStore`
+* Moved calculating checksum from MetaTable to TableStore
+* Added PandasParquetFile adapter for TableStoreFiledir to store pandas
+  DataFrames in parquet
+* Added hash_row for BytesFile and PILFile
+* Added use_adapter_hash parameter in TableStoreFiledir for backward
+  compatibility
+
+# 0.14.5
 
 * Fix for getting existing idx of empy meta-table
+* Add `keep_existing=True` to `TransformMetaTable` to prevent table metadata
+  conflicts
+* Enhance `RedisStore` with multi-node cluster support and password
+  authentication
 
 # 0.14.4
 

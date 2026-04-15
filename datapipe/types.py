@@ -9,6 +9,7 @@ from typing import (
     Dict,
     List,
     NewType,
+    Optional,
     Set,
     Tuple,
     Type,
@@ -39,6 +40,9 @@ MetaSchema = List[Column]
 # Dataframe with columns (<index_cols ...>)
 IndexDF = NewType("IndexDF", pd.DataFrame)
 
+# Dataframe with columns (<index_cols ...>, hash)
+HashDF = NewType("HashDF", pd.DataFrame)
+
 # Dataframe with columns (<index_cols ...>, hash, create_ts, update_ts, process_ts, delete_ts)
 MetadataDF = NewType("MetadataDF", pd.DataFrame)
 
@@ -60,6 +64,9 @@ TableOrName = Union[str, OrmTable, "Table"]
 @dataclass
 class JoinSpec:
     table: TableOrName
+    # Filtered join optimization: mapping from idx columns to table columns
+    # Example: {"user_id": "id"} means filter table by table.id IN (idx.user_id)
+    join_keys: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -73,6 +80,8 @@ PipelineInput = Union[TableOrName, JoinSpec]
 @dataclass
 class ChangeList:
     changes: Dict[str, IndexDF] = field(default_factory=lambda: cast(Dict[str, IndexDF], {}))
+    # Offset'ы для оптимизации: (step_name, input_table_name) -> max_update_ts
+    offsets: Dict[Tuple[str, str], float] = field(default_factory=dict)
 
     def append(self, table_name: str, idx: IndexDF) -> None:
         if table_name in self.changes:
@@ -89,6 +98,10 @@ class ChangeList:
     def extend(self, other: ChangeList):
         for key in other.changes.keys():
             self.append(key, other.changes[key])
+
+        # Объединяем offset'ы: берем максимум для каждого ключа
+        for offset_key, offset_value in other.offsets.items():
+            self.offsets[offset_key] = max(self.offsets.get(offset_key, 0), offset_value)
 
     def empty(self):
         return len(self.changes.keys()) == 0
@@ -107,6 +120,10 @@ def data_to_index(data_df: DataDF, primary_keys: List[str]) -> IndexDF:
 
 def meta_to_index(meta_df: MetadataDF, primary_keys: List[str]) -> IndexDF:
     return cast(IndexDF, meta_df[primary_keys])
+
+
+def hash_to_index(hash_df: HashDF, primary_keys: List[str]) -> IndexDF:
+    return cast(IndexDF, hash_df[primary_keys])
 
 
 def index_difference(idx1_df: IndexDF, idx2_df: IndexDF) -> IndexDF:

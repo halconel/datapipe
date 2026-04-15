@@ -16,6 +16,26 @@ from sqlalchemy import create_engine, text
 from datapipe.store.database import DBConn
 
 
+def pytest_collection_modifyitems(config, items):
+    """
+    Исключить performance тесты из обычного test run.
+
+    Performance тесты должны запускаться отдельно: pytest tests/performance/
+    """
+    # Если явно указана директория performance в аргументах, не фильтруем
+    args_str = " ".join(config.invocation_params.args)
+    if "performance" in args_str:
+        return
+
+    # Исключить все тесты из tests/performance/ если не указано явно
+    remaining = []
+    for item in items:
+        if "performance" not in str(item.fspath):
+            remaining.append(item)
+
+    items[:] = remaining
+
+
 @pytest.fixture
 def tmp_dir():
     with tempfile.TemporaryDirectory() as d:
@@ -51,7 +71,12 @@ def assert_df_equal(a: pd.DataFrame, b: pd.DataFrame) -> bool:
 @pytest.fixture
 def dbconn():
     if os.environ.get("TEST_DB_ENV") == "sqlite":
-        DBCONNSTR = "sqlite+pysqlite3:///:memory:"
+        # Try pysqlite3 first (CI), fallback to pysqlite (local dev)
+        try:
+            import pysqlite3  # noqa: F401
+            DBCONNSTR = "sqlite+pysqlite3:///:memory:"
+        except ImportError:
+            DBCONNSTR = "sqlite+pysqlite:///:memory:"
         DB_TEST_SCHEMA = None
     else:
         pg_host = os.getenv("POSTGRES_HOST", "localhost")

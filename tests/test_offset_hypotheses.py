@@ -1,0 +1,525 @@
+"""
+Раздельные тесты для гипотез 1 и 2.
+
+ВАЖНО: Эти тесты независимы и проверяют РАЗНЫЕ проблемы!
+
+Гипотеза 1: Строгое неравенство update_ts > offset
+Гипотеза 2: ORDER BY по transform_keys, а не по update_ts
+"""
+import time
+
+import pandas as pd
+import pytest
+from sqlalchemy import Column, Integer, String
+
+from datapipe.compute import ComputeInput
+from datapipe.datatable import DataStore
+from datapipe.step.batch_transform import BatchTransformStep
+from datapipe.store.database import DBConn, TableStoreDB
+
+
+def test_hypothesis_1_strict_inequality_loses_records_with_equal_update_ts(dbconn: DBConn):
+    """
+    Тест ТОЛЬКО для гипотезы 1: Строгое неравенство update_ts > offset.
+
+    Сценарий:
+    - ВСЕ записи имеют ОДИНАКОВЫЙ update_ts
+    - Записи сортируются по id (это не важно для этого теста)
+    - Первый батч: обрабатываем 5 записей с update_ts=T1
+    - offset = MAX(T1) = T1
+    - Второй запуск: WHERE update_ts > T1 пропускает записи с update_ts == T1
+
+    Результат: Все необработанные записи с update_ts == offset ПОТЕРЯНЫ!
+
+    === КАК ЭТО МОЖЕТ ПРОИЗОЙТИ В PRODUCTION ===
+
+    1. **Bulk insert / Batch processing**:
+       - Приложение получает пакет данных (например, 1000 записей из внешнего API)
+       - Все записи вставляются одним вызовом store_chunk(df, now=current_time)
+       - Результат: 1000 записей с ОДИНАКОВЫМ update_ts
+
+    2. **Миграция данных**:
+       - Перенос исторических данных из старой системы
+       - Данные импортируются пакетами с одним timestamp
+       - Результат: Тысячи записей с одинаковым update_ts
+
+    3. **Реальный production кейс (из hashtag_issue.md)**:
+       - Трансформация extract_hashtags создала записи пакетами
+       - Каждый пост может иметь несколько хештегов → несколько записей с одним update_ts
+       - Пример: пост с 5 хештегами → 5 записей с одинаковым update_ts
+       - При chunk_size=10 часть записей попадает в первый батч, часть остается
+       - offset устанавливается на update_ts первого батча
+       - Оставшиеся записи с тем же update_ts ТЕРЯЮТСЯ!
+
+    4. **High-load scenario**:
+       - При высокой нагрузке записи могут создаваться очень быстро
+       - Точность timestamp может быть до секунды или миллисекунды
+       - В рамках одной миллисекунды может быть создано 10-100+ записей
+       - Результат: Множество записей с одинаковым update_ts
+
+    Этот тест должен ПРОЙТИ при исправлении:
+    - ✅ update_ts > offset → update_ts >= offset
+
+    Этот тест НЕ должен зависеть от:
+    - ❌ Порядка сортировки (ORDER BY id vs ORDER BY update_ts)
+    """
+    ds = DataStore(dbconn, create_meta_table=True)
+
+    input_store = TableStoreDB(
+        dbconn,
+        "hyp1_input",
+        [Column("id", String, primary_key=True), Column("value", Integer)],
+        create_table=True,
+    )
+    input_dt = ds.create_table("hyp1_input", input_store)
+
+    output_store = TableStoreDB(
+        dbconn,
+        "hyp1_output",
+        [Column("id", String, primary_key=True), Column("value", Integer)],
+        create_table=True,
+    )
+    output_dt = ds.create_table("hyp1_output", output_store)
+
+    def copy_func(df):
+        return df[["id", "value"]]
+
+    step = BatchTransformStep(
+        ds=ds,
+        name="hyp1_copy",
+        func=copy_func,
+        input_dts=[ComputeInput(dt=input_dt, join_type="full")],
+        output_dts=[output_dt],
+        transform_keys=["id"],
+        use_offset_optimization=True,
+        chunk_size=5,
+    )
+
+    # Создаем первую партию записей с ОДИНАКОВЫМ update_ts
+    # Симулируем bulk insert или batch processing
+    base_time = time.time()
+    same_timestamp = base_time + 1
+
+    first_batch_df = pd.DataFrame({
+        "id": [f"rec_{i:02d}" for i in range(7)],
+        "value": list(range(7)),
+    })
+
+    # Одним вызовом store_chunk - как в production при bulk insert
+    input_dt.store_chunk(first_batch_df, now=same_timestamp)
+    time.sleep(0.001)
+
+    print(f"\n=== ПОДГОТОВКА ===")
+    print(f"Создано {len(first_batch_df)} записей с update_ts = {same_timestamp:.2f}")
+    print("(Симуляция bulk insert или batch processing)")
+
+    # ПЕРВЫЙ ЗАПУСК: обрабатываем ВСЕ записи через run_full
+    print(f"\n=== ПЕРВЫЙ ЗАПУСК (run_full) ===")
+    step.run_full(ds)
+
+    # Проверяем offset
+    offsets = ds.offset_table.get_offsets_for_transformation(step.get_name())
+    offset_after_first = offsets["hyp1_input"]
+
+    output_after_first = output_dt.get_data()
+    processed_ids_first = set(output_after_first["id"].tolist())
+
+    print(f"Обработано: {len(output_after_first)} записей")
+    print(f"offset = {offset_after_first:.2f}")
+    print(f"Обработанные id: {sorted(processed_ids_first)}")
+
+    assert len(processed_ids_first) == 7, "Должно быть обработано 7 записей"
+
+    # ДОБАВЛЯЕМ НОВЫЕ ЗАПИСИ с ТЕМ ЖЕ update_ts
+    # Это критический момент: новые записи имеют update_ts == offset
+    time.sleep(0.001)
+    second_batch_df = pd.DataFrame({
+        "id": [f"rec_{i:02d}" for i in range(7, 12)],
+        "value": list(range(7, 12)),
+    })
+    input_dt.store_chunk(second_batch_df, now=same_timestamp)  # ТОТ ЖЕ timestamp!
+
+    print(f"\n=== ДОБАВЛЕНЫ НОВЫЕ ЗАПИСИ ===")
+    print(f"Добавлено {len(second_batch_df)} записей с update_ts = {same_timestamp:.2f}")
+    print(f"update_ts == offset ({same_timestamp:.2f} == {offset_after_first:.2f})")
+
+    # ВТОРОЙ ЗАПУСК: проверяем что записи с update_ts == offset обработаются
+    print(f"\n=== ВТОРОЙ ЗАПУСК (run_full) ===")
+    step.run_full(ds)
+
+    # ПРОВЕРКА: НОВЫЕ записи с update_ts == offset должны быть обработаны
+    final_output = output_dt.get_data()
+    final_processed_ids = set(final_output["id"].tolist())
+
+    all_expected_ids = set([f"rec_{i:02d}" for i in range(12)])
+    lost_records = all_expected_ids - final_processed_ids
+
+    if lost_records:
+        print(f"\n=== 🚨 ПОТЕРЯННЫЕ ЗАПИСИ (БАГ!) ===")
+        print(f"Потерянные id: {sorted(lost_records)}")
+        print(f"Все они имеют update_ts == offset ({same_timestamp:.2f})")
+
+        pytest.fail(
+            f"ГИПОТЕЗА 1 ПОДТВЕРЖДЕНА: {len(lost_records)} записей с update_ts == offset ПОТЕРЯНЫ!\n"
+            f"Ожидалось: {len(all_expected_ids)} записей\n"
+            f"Получено:  {len(final_output)} записей\n"
+            f"Потеряно:  {len(lost_records)} записей\n"
+            f"Потерянные id: {sorted(lost_records)}\n\n"
+            f"Причина: Строгое неравенство 'update_ts > offset' пропускает записи с update_ts == offset\n"
+            f"Исправление: datapipe/meta/sql_meta.py - заменить '>' на '>='"
+        )
+
+    print(f"\n=== ✅ ВСЕ ЗАПИСИ ОБРАБОТАНЫ ===")
+    print(f"Всего записей: {len(all_expected_ids)}")
+    print(f"Обработано:    {len(final_output)}")
+
+
+def test_hypothesis_2_order_by_transform_keys_with_mixed_update_ts(dbconn: DBConn):
+    """
+    Тест ТОЛЬКО для гипотезы 2: ORDER BY по transform_keys, а не по update_ts.
+
+    Сценарий:
+    - Записи имеют РАЗНЫЕ update_ts
+    - Записи сортируются по id (transform_keys), НЕ по update_ts
+    - В батч попадают записи с разными update_ts (например: T1, T1, T3, T3, T3)
+    - offset = MAX(T1, T1, T3, T3, T3) = T3
+    - Но есть запись с id ПОСЛЕ последней обработанной, но с update_ts < T3
+    - Второй запуск: WHERE update_ts > T3 пропускает эту запись
+
+    ВАЖНО: Этот тест должен ПАДАТЬ даже при исправлении гипотезы 1 (> на >=)!
+    Для этого мы НЕ должны иметь записей с update_ts == offset в необработанных данных.
+
+    Этот тест должен ПРОЙТИ при исправлении:
+    - ✅ ORDER BY transform_keys → ORDER BY update_ts
+    - ИЛИ другой способ обеспечить что offset не превышает MAX(update_ts обработанных записей)
+
+    Этот тест НЕ должен пройти при исправлении:
+    - ❌ update_ts > offset → update_ts >= offset (гипотеза 1)
+    """
+    ds = DataStore(dbconn, create_meta_table=True)
+
+    input_store = TableStoreDB(
+        dbconn,
+        "hyp2_input",
+        [Column("id", String, primary_key=True), Column("value", Integer)],
+        create_table=True,
+    )
+    input_dt = ds.create_table("hyp2_input", input_store)
+
+    output_store = TableStoreDB(
+        dbconn,
+        "hyp2_output",
+        [Column("id", String, primary_key=True), Column("value", Integer)],
+        create_table=True,
+    )
+    output_dt = ds.create_table("hyp2_output", output_store)
+
+    def copy_func(df):
+        return df[["id", "value"]]
+
+    step = BatchTransformStep(
+        ds=ds,
+        name="hyp2_copy",
+        func=copy_func,
+        input_dts=[ComputeInput(dt=input_dt, join_type="full")],
+        output_dts=[output_dt],
+        transform_keys=["id"],
+        use_offset_optimization=True,
+        chunk_size=5,
+    )
+
+    # Создаем записи с РАЗНЫМИ update_ts в "неправильном" порядке id
+    base_time = time.time()
+
+    # Группа 1: T1 - ранний timestamp
+    t1 = base_time + 1
+    input_dt.store_chunk(
+        pd.DataFrame({"id": ["rec_00", "rec_01"], "value": [0, 1]}),
+        now=t1
+    )
+    time.sleep(0.001)
+
+    # Группа 2: T3 - ПОЗДНИЙ timestamp (специально создаем "дыру")
+    t3 = base_time + 3
+    input_dt.store_chunk(
+        pd.DataFrame({"id": ["rec_02", "rec_03", "rec_04"], "value": [2, 3, 4]}),
+        now=t3
+    )
+    time.sleep(0.001)
+
+    # Группа 3: T2 - СРЕДНИЙ timestamp (но id ПОСЛЕ первого батча)
+    t2 = base_time + 2
+    input_dt.store_chunk(
+        pd.DataFrame({"id": ["rec_05", "rec_06", "rec_07"], "value": [5, 6, 7]}),
+        now=t2  # Старый timestamp, но id ПОСЛЕ rec_04!
+    )
+    time.sleep(0.001)
+
+    # Группа 4: T4 - Еще более поздний timestamp
+    t4 = base_time + 4
+    input_dt.store_chunk(
+        pd.DataFrame({"id": ["rec_08", "rec_09", "rec_10"], "value": [8, 9, 10]}),
+        now=t4
+    )
+
+    # Проверяем данные
+    all_meta = input_dt.meta_table.get_metadata()
+    print(f"\n=== ПОДГОТОВКА ===")
+    print(f"Всего записей: {len(all_meta)}")
+    print("Распределение по update_ts (сортировка по id):")
+    for idx, row in all_meta.sort_values("id").iterrows():
+        ts_label = "T1" if abs(row["update_ts"] - t1) < 0.01 else \
+                   "T2" if abs(row["update_ts"] - t2) < 0.01 else \
+                   "T3" if abs(row["update_ts"] - t3) < 0.01 else "T4"
+        print(f"  id={row['id']:10} update_ts={ts_label} ({row['update_ts']:.2f})")
+
+    # ПЕРВЫЙ ЗАПУСК: обрабатываем ВСЕ записи через run_full
+    print(f"\n=== ПЕРВЫЙ ЗАПУСК (run_full) ===")
+    step.run_full(ds)
+
+    # Проверяем offset
+    offsets = ds.offset_table.get_offsets_for_transformation(step.get_name())
+    offset_after_first = offsets["hyp2_input"]
+
+    output_after_first = output_dt.get_data()
+    processed_ids = set(output_after_first["id"].tolist())
+
+    print(f"Обработано: {len(output_after_first)} записей")
+    print(f"offset = {offset_after_first:.2f} (должно быть T4 = {t4:.2f})")
+    print(f"Обработанные id: {sorted(processed_ids)}")
+
+    all_input_ids = set(all_meta["id"].tolist())
+    assert processed_ids == all_input_ids, "Все исходные записи должны быть обработаны"
+
+    # ДОБАВЛЯЕМ НОВЫЕ ЗАПИСИ с update_ts БОЛЬШЕ offset
+    # Критический тест: даже если id меньше последних обработанных,
+    # записи должны обработаться благодаря сортировке по update_ts
+    time.sleep(0.001)
+    t_new = t4 + 1  # Timestamp больше всех предыдущих
+
+    new_records_df = pd.DataFrame({
+        "id": ["rec_new_1", "rec_new_2"],  # Префикс "rec_new" сортируется после "rec_10"
+        "value": [11, 12],
+    })
+    input_dt.store_chunk(new_records_df, now=t_new)
+
+    print(f"\n=== ДОБАВЛЕНЫ НОВЫЕ ЗАПИСИ ===")
+    print(f"Добавлено {len(new_records_df)} записей с update_ts = {t_new:.2f}")
+    print(f"update_ts ({t_new:.2f}) > offset ({offset_after_first:.2f})")
+    print(f"Новые id: {sorted(new_records_df['id'].tolist())}")
+    print("С правильной сортировкой по update_ts эти записи будут обработаны")
+
+    # ВТОРОЙ ЗАПУСК: с учетом offset и сортировки по update_ts
+    print(f"\n=== ВТОРОЙ ЗАПУСК (run_full) ===")
+    step.run_full(ds)
+
+    # ПРОВЕРКА: НОВЫЕ записи с update_ts > offset должны быть обработаны
+    final_output = output_dt.get_data()
+    final_processed_ids = set(final_output["id"].tolist())
+
+    all_expected_ids = all_input_ids | set(new_records_df["id"].tolist())
+    lost_records = all_expected_ids - final_processed_ids
+
+    if lost_records:
+        all_meta_final = input_dt.meta_table.get_metadata()
+        lost_meta = all_meta_final[all_meta_final["id"].isin(lost_records)]
+        print(f"\n=== 🚨 ПОТЕРЯННЫЕ ЗАПИСИ (БАГ!) ===")
+        for idx, row in lost_meta.sort_values("id").iterrows():
+            print(
+                f"  id={row['id']:10} update_ts={row['update_ts']:.2f} "
+                f"> offset={offset_after_first:.2f} (но все равно пропущены!)"
+            )
+
+        pytest.fail(
+            f"ГИПОТЕЗА 2 ПОДТВЕРЖДЕНА: {len(lost_records)} записей ПОТЕРЯНЫ из-за ORDER BY по transform_keys!\n"
+            f"Ожидалось: {len(all_input_ids)} записей\n"
+            f"Получено:  {len(final_output)} записей\n"
+            f"Потеряно:  {len(lost_records)} записей\n"
+            f"Потерянные id: {sorted(lost_records)}\n\n"
+            f"Причина: Батчи сортируются ORDER BY transform_keys (id), но offset = MAX(update_ts).\n"
+            f"         Записи с id ПОСЛЕ последней обработанной, но с update_ts < offset ПОТЕРЯНЫ.\n"
+            f"Исправление: Либо сортировать по update_ts, либо пересмотреть логику offset."
+        )
+
+    print(f"\n=== ✅ ВСЕ ЗАПИСИ ОБРАБОТАНЫ ===")
+    print(f"Всего записей: {len(all_input_ids)}")
+    print(f"Обработано:    {len(final_output)}")
+
+
+def test_antiregression_no_infinite_loop_with_equal_update_ts(dbconn: DBConn):
+    """
+    Анти-регрессионный тест: Проверяет что после исправления > на >= не возникает зацикливание.
+
+    ВАЖНО: Этот тест должен ПРОХОДИТЬ (не xfail) и после исправления тоже должен проходить!
+
+    Сценарий:
+    1. Создаем 12 записей с ОДИНАКОВЫМ update_ts (bulk insert)
+    2. Первый запуск: обрабатываем первый батч (5 записей)
+       - offset = T1
+       - Проверяем что обработано ровно 5 записей
+    3. Второй запуск: обрабатываем следующий батч (5 записей с update_ts == T1)
+       - Проверяем что обработано ровно 5 НОВЫХ записей (не те же самые!)
+       - Проверяем что offset НЕ изменился (всё ещё T1)
+    4. Третий запуск: обрабатываем последний батч (2 записи)
+       - Проверяем что обработано 2 новых записи
+    5. Добавляем НОВЫЕ записи с update_ts > T1
+       - Проверяем что новые записи будут обработаны
+
+    Критично:
+    - Каждый запуск должен обрабатывать НОВЫЕ записи, не зацикливаться на одних и тех же
+    - После исправления >= система должна корректно обрабатывать записи с update_ts == offset
+    - process_ts должен обновляться для обработанных записей
+    """
+    ds = DataStore(dbconn, create_meta_table=True)
+
+    input_store = TableStoreDB(
+        dbconn,
+        "antiregr_input",
+        [Column("id", String, primary_key=True), Column("value", Integer)],
+        create_table=True,
+    )
+    input_dt = ds.create_table("antiregr_input", input_store)
+
+    output_store = TableStoreDB(
+        dbconn,
+        "antiregr_output",
+        [Column("id", String, primary_key=True), Column("value", Integer)],
+        create_table=True,
+    )
+    output_dt = ds.create_table("antiregr_output", output_store)
+
+    def copy_func(df):
+        return df[["id", "value"]]
+
+    step = BatchTransformStep(
+        ds=ds,
+        name="antiregr_copy",
+        func=copy_func,
+        input_dts=[ComputeInput(dt=input_dt, join_type="full")],
+        output_dts=[output_dt],
+        transform_keys=["id"],
+        use_offset_optimization=True,
+        chunk_size=5,
+    )
+
+    # Создаем первую партию с ОДИНАКОВЫМ update_ts (bulk insert)
+    base_time = time.time()
+    same_timestamp = base_time + 1
+
+    first_batch_df = pd.DataFrame({
+        "id": [f"rec_{i:02d}" for i in range(12)],
+        "value": list(range(12)),
+    })
+
+    input_dt.store_chunk(first_batch_df, now=same_timestamp)
+    time.sleep(0.001)
+
+    print(f"\n=== ПОДГОТОВКА ===")
+    print(f"Создано {len(first_batch_df)} записей с одинаковым update_ts = {same_timestamp:.2f}")
+
+    # ========== ПЕРВЫЙ ЗАПУСК (run_full): обработать все ==========
+    print(f"\n=== ПЕРВЫЙ ЗАПУСК (run_full) ===")
+    step.run_full(ds)
+
+    output_1 = output_dt.get_data()
+    processed_ids_1 = set(output_1["id"].tolist())
+    offsets_1 = ds.offset_table.get_offsets_for_transformation(step.get_name())
+    offset_1 = offsets_1["antiregr_input"]
+
+    print(f"Обработано: {len(output_1)} записей")
+    print(f"offset = {offset_1:.2f}")
+    print(f"Обработанные id: {sorted(processed_ids_1)}")
+
+    assert len(output_1) == 12, f"Ожидалось 12 записей, получено {len(output_1)}"
+    first_batch_offset = offset_1
+
+    # ========== ДОБАВЛЯЕМ НОВЫЕ ЗАПИСИ с ТЕМ ЖЕ update_ts ==  offset ==========
+    # Критический момент: проверяем что нет зацикливания на записях с update_ts == offset
+    time.sleep(0.001)
+    second_batch_df = pd.DataFrame({
+        "id": [f"same_{i:02d}" for i in range(5)],
+        "value": list(range(50, 55)),
+    })
+    input_dt.store_chunk(second_batch_df, now=same_timestamp)  # ТОТ ЖЕ timestamp!
+
+    print(f"\n=== ДОБАВЛЕНЫ НОВЫЕ ЗАПИСИ ===")
+    print(f"Добавлено {len(second_batch_df)} записей с update_ts = {same_timestamp:.2f}")
+    print(f"update_ts == offset ({same_timestamp:.2f} == {offset_1:.2f})")
+
+    # ========== ВТОРОЙ ЗАПУСК: проверяем что нет зацикливания ==========
+    print(f"\n=== ВТОРОЙ ЗАПУСК (run_full) ===")
+    step.run_full(ds)
+
+    output_2 = output_dt.get_data()
+    processed_ids_2 = set(output_2["id"].tolist())
+    new_ids_2 = processed_ids_2 - processed_ids_1
+    offsets_2 = ds.offset_table.get_offsets_for_transformation(step.get_name())
+    offset_2 = offsets_2["antiregr_input"]
+
+    print(f"Всего обработано: {len(output_2)} записей")
+    print(f"Новых записей: {len(new_ids_2)}")
+    print(f"Новые id: {sorted(new_ids_2)}")
+    print(f"offset = {offset_2:.2f}")
+
+    # Критичная проверка: должны обработать НОВЫЕ записи (с update_ts == offset)
+    assert len(new_ids_2) == 5, (
+        f"Ожидалось 5 НОВЫХ записей с update_ts == offset, получено {len(new_ids_2)}!\n"
+        f"Возможно баг: записи с update_ts == offset не обработаны."
+    )
+    assert len(output_2) == 17, f"Всего должно быть 17 записей, получено {len(output_2)}"
+
+    # Проверяем что это действительно НОВЫЕ записи, а не зацикливание
+    intersection = processed_ids_1 & new_ids_2
+    assert len(intersection) == 0, (
+        f"ЗАЦИКЛИВАНИЕ: Повторно обрабатываем те же записи: {sorted(intersection)}"
+    )
+    assert all(id.startswith("same_") for id in new_ids_2), (
+        f"Новые записи должны начинаться с 'same_', получено: {sorted(new_ids_2)}"
+    )
+
+    # ========== ДОБАВЛЯЕМ ЗАПИСИ с update_ts > offset ==========
+    time.sleep(0.01)
+    new_timestamp = same_timestamp + 1  # Гарантированно больше чем offset
+    third_batch_df = pd.DataFrame({
+        "id": [f"new_{i:02d}" for i in range(5)],
+        "value": list(range(100, 105)),
+    })
+    input_dt.store_chunk(third_batch_df, now=new_timestamp)
+
+    print(f"\n=== ДОБАВЛЕНЫ НОВЫЕ ЗАПИСИ ===")
+    print(f"Добавлено {len(third_batch_df)} записей с update_ts = {new_timestamp:.2f} > offset = {offset_2:.2f}")
+
+    # ========== ТРЕТИЙ ЗАПУСК: новые записи с update_ts > offset ==========
+    print(f"\n=== ТРЕТИЙ ЗАПУСК (run_full) ===")
+    step.run_full(ds)
+
+    output_3 = output_dt.get_data()
+    processed_ids_3 = set(output_3["id"].tolist())
+    new_ids_3 = processed_ids_3 - processed_ids_2
+    offsets_3 = ds.offset_table.get_offsets_for_transformation(step.get_name())
+    offset_3 = offsets_3["antiregr_input"]
+
+    print(f"Всего обработано: {len(output_3)} записей")
+    print(f"Новых записей: {len(new_ids_3)}")
+    print(f"Новые id: {sorted(new_ids_3)}")
+    print(f"offset = {offset_3:.2f}")
+
+    assert len(output_3) == 22, f"Всего должно быть 22 записи (12 + 5 + 5), получено {len(output_3)}"
+    assert len(new_ids_3) == 5, f"Ожидалось 5 новых записей, получено {len(new_ids_3)}"
+    assert offset_3 > offset_2, (
+        f"offset должен обновиться для записей с update_ts > offset! "
+        f"Был {offset_2:.2f}, остался {offset_3:.2f}"
+    )
+
+    # Проверяем что новые записи действительно новые
+    assert all(id.startswith("new_") for id in new_ids_3), (
+        f"Новые записи должны начинаться с 'new_', получено: {sorted(new_ids_3)}"
+    )
+
+    print(f"\n=== ✅ ВСЕ ПРОВЕРКИ ПРОШЛИ ===")
+    print("1. Нет зацикливания на одних и тех же записях")
+    print("2. Записи с update_ts == offset обрабатываются корректно (>=)")
+    print("3. Записи с update_ts > offset также обрабатываются")
+    print("3. Записи с update_ts == offset корректно обрабатываются")
+    print("4. Новые записи с update_ts > offset корректно обрабатываются")
+    print("5. offset корректно обновляется")
